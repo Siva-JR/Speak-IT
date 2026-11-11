@@ -14,17 +14,27 @@ warn() { printf '\033[33m[warn]\033[0m %s\n' "$*"; }
 die() { printf '\033[31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
 case "$(uname -s)" in Linux) OS=linux ;; Darwin) OS=mac ;; *) OS=windows ;; esac
-[ "$OS" = windows ] && PYBIN="$VENV/Scripts/python" || PYBIN="$VENV/bin/python"
+# first interpreter that RUNS and is >= 3.11 (skips the Windows Store python3 stub, which exists but fails)
+find_python() {
+  local c
+  for c in python3.12 python3.11 python3 python "py -3"; do
+    # shellcheck disable=SC2086
+    if $c -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then echo "$c"; return 0; fi
+  done
+  return 1
+}
+venv_python() { for p in "$VENV/bin/python" "$VENV/Scripts/python.exe" "$VENV/Scripts/python"; do [ -f "$p" ] && { echo "$p"; return; }; done; }
 
 say "1/5 Python environment ($OS)"
-if [ ! -x "$PYBIN" ]; then
-  if command -v uv >/dev/null; then uv venv --python 3.12 "$VENV"
+PYBIN="$(venv_python || true)"
+if [ -z "$PYBIN" ]; then
+  if command -v uv >/dev/null && uv venv --python 3.12 "$VENV" 2>/dev/null; then :
   else
-    PYSYS="$(command -v python3.12 || command -v python3.11 || command -v python3 || command -v python || true)"
-    [ -n "$PYSYS" ] || die "no Python found. Install Python 3.11+ (or uv: https://docs.astral.sh/uv/)"
-    "$PYSYS" -c 'import sys; sys.exit(sys.version_info < (3, 11))' || die "Python 3.11+ required (found $("$PYSYS" -V))"
-    "$PYSYS" -m venv "$VENV"
+    PYSYS="$(find_python)" || die "no working Python 3.11+ found. Install it from python.org (tick 'Add to PATH') or install uv, then re-run"
+    echo "using: $PYSYS ($($PYSYS -V))"
+    $PYSYS -m venv "$VENV"
   fi
+  PYBIN="$(venv_python)" || die "venv was created but has no python inside $VENV"
 fi
 if command -v uv >/dev/null; then uv pip install --python "$PYBIN" -r "$HERE/requirements.txt"
 else "$PYBIN" -m pip install -q --upgrade pip && "$PYBIN" -m pip install -q -r "$HERE/requirements.txt"; fi
