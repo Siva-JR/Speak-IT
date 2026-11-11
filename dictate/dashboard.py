@@ -95,10 +95,11 @@ def checks():
         add("python: sounddevice", pkg("sounddevice"), "pip install sounddevice (microphone)")
         try:
             import platform_win
-            devs = platform_win.mic_devices()
-            add("microphone device", devs, devs[0] if devs else "none found: Settings > Privacy > Microphone, and check the default input")
+            import sounddevice as sd      # passive: listing only, never open the mic from a page that polls every 2 s
+            names = [sd.query_devices()[i]["name"] for i in platform_win.candidate_inputs(sd, None)]
+            add("microphone present", names, f"{len(names)} input(s), first tried: {names[0]}. Run 'dictate doctor' to test opening it")
         except Exception as e:
-            add("microphone device", False, f"{type(e).__name__}: {e}")
+            add("microphone present", False, f"{type(e).__name__}: {e}")
         add("startup shortcut", (Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup/Dictate.lnk").exists(),
             "created by install.ps1 (daemon starts at login)", "warn")
     d = daemon_status()

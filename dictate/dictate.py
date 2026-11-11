@@ -398,7 +398,7 @@ class Daemon:
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             self.rec_thread = threading.Thread(target=self._pump, daemon=True); self.rec_thread.start()
         self.recording, self.t_rec = True, time.time()
-        elog("rec_start", portal_ready=self.typer.ready.is_set())
+        elog("rec_start", portal_ready=self.typer.ready.is_set(), mic=getattr(self.rec, "name", None))
         threading.Thread(target=self._cpu_watch, daemon=True).start()       # is the machine busy? (picks engine threads)
         threading.Thread(target=self.worker.ensure, daemon=True).start()   # model loads while you speak
         if self.portal_mode():
@@ -646,8 +646,7 @@ def doctor_windows():
     for mod, why in (("faster_whisper", "speech model"), ("sounddevice", "microphone"), ("psutil", "stats"), ("numpy", "audio")):
         print(f"[{ok(importlib.util.find_spec(mod))}] python: {mod} ({why})")
     try:
-        devs = _pw.mic_devices()
-        print(f"[{ok(devs)}] microphone: {devs[0] if devs else 'no input device found (Settings > Privacy > Microphone)'}")
+        print(f"[ok ] microphone: opened {_pw.probe_mic(load_config().get('mic_device'))}")
     except Exception as e:
         print(f"[FAIL] microphone: {e}")
     try:

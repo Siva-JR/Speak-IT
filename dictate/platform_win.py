@@ -189,14 +189,100 @@ def start_hotkey(spec, callback, log=lambda *a, **k: None):
 
 
 # ----------------------------------------------------------------------------- microphone
+class Resampler:
+    """Streaming mono resampler (box low-pass when downsampling + linear interpolation), enough for speech.
+    Keeps phase and a short tail between blocks so block boundaries do not click."""
+    def __init__(self, src, dst):
+        import numpy as np
+        self.np, self.step, self.pos, self.tail = np, src / dst, 0.0, np.zeros(0, dtype=np.float32)
+        self.k = max(1, int(round(self.step))) if self.step >= 1.5 else 1
+
+    def process(self, x):
+        np = self.np
+        buf = np.concatenate([self.tail, x.astype(np.float32, copy=False)])
+        if len(buf) < self.k + 1:
+            self.tail = buf; return np.zeros(0, dtype=np.float32)
+        sm = np.convolve(buf, np.ones(self.k, dtype=np.float32) / self.k, mode="same") if self.k > 1 else buf
+        idx = np.arange(self.pos, len(buf) - 1, self.step)
+        out = np.interp(idx, np.arange(len(buf)), sm).astype(np.float32)
+        nxt = (idx[-1] + self.step) if len(idx) else self.pos
+        keep = max(0, int(nxt) - self.k)
+        self.tail, self.pos = buf[keep:], nxt - keep
+        return out
+
+
+def candidate_inputs(sd, spec=None):
+    """Input device indices to try, best first. spec: None (auto), an index, or a name substring.
+    Auto order: the system default (if set), then each host API's own default input (default host API first),
+    then every other input. No device names are assumed; the caller just tries them in order."""
+    devs = sd.query_devices()
+    inputs = [i for i, d in enumerate(devs) if d.get("max_input_channels", 0) > 0]
+    if not inputs:
+        raise RuntimeError("no microphone found (Windows: Settings > Privacy & security > Microphone: allow desktop apps)")
+    if spec not in (None, ""):
+        if str(spec).lstrip("-").isdigit():
+            return [int(spec)]
+        hits = [i for i in inputs if str(spec).lower() in devs[i]["name"].lower()]
+        if not hits:
+            raise RuntimeError(f"mic_device {spec!r} matches no input; available: {[devs[i]['name'] for i in inputs]}")
+        return hits
+    order = []
+    def add(i):
+        if isinstance(i, int) and i in inputs and i not in order:
+            order.append(i)
+    try:
+        add(sd.default.device[0])
+    except Exception:
+        pass
+    try:
+        apis = sd.query_hostapis()
+        first = sd.default.hostapi if isinstance(getattr(sd.default, "hostapi", None), int) else 0
+        for a in [first] + [k for k in range(len(apis)) if k != first]:
+            add(apis[a].get("default_input_device"))
+    except Exception:
+        pass
+    for i in inputs:
+        add(i)
+    return order
+
+
+def open_input(sd, chunks, spec=None):
+    """Open the first input that works, in whatever format it supports, appending 16 kHz mono int16 bytes to chunks.
+    Returns (running stream, device name, description). Raises one error listing every failure."""
+    import numpy as np
+    failures, devs = [], sd.query_devices()
+    for idx in candidate_inputs(sd, spec):
+        d = devs[idx]
+        native_sr = int(d.get("default_samplerate") or SR)
+        formats = [(SR, 1), (native_sr, 1)] + ([(native_sr, int(d["max_input_channels"]))] if d["max_input_channels"] > 1 else [])
+        for sr, ch in dict.fromkeys(formats):
+            try:
+                if sr == SR and ch == 1:
+                    cb = lambda indata, frames, t, status: chunks.append(bytes(indata))
+                    rs = None
+                else:
+                    rs = Resampler(sr, SR) if sr != SR else None
+                    def cb(indata, frames, t, status, ch=ch, rs=rs):
+                        x = np.frombuffer(indata, dtype=np.int16).astype(np.float32)
+                        if ch > 1:
+                            x = x.reshape(-1, ch).mean(axis=1)
+                        if rs is not None:
+                            x = rs.process(x)
+                        chunks.append(np.clip(x, -32768, 32767).astype(np.int16).tobytes())
+                st = sd.RawInputStream(samplerate=sr, channels=ch, dtype="int16", blocksize=int(sr / 10), device=idx, callback=cb)
+                st.start()
+                return st, d["name"], f"{sr} Hz x{ch}" + (" (converted to 16 kHz mono)" if (sr, ch) != (SR, 1) else "")
+            except Exception as e:
+                failures.append(f"{d['name']} @ {sr} Hz x{ch}: {str(e)[:90]}")
+    raise RuntimeError("could not open any microphone: " + " | ".join(failures[:6]))
+
+
 class Recorder:
-    """16 kHz mono int16 capture into `chunks` (a list of bytes). Same terminate()/wait() shape as the arecord Popen."""
+    """Microphone capture into `chunks`. Same terminate()/wait() shape as the arecord Popen on Linux."""
     def __init__(self, chunks, device=None):
         import sounddevice as sd
         self.chunks = chunks
-        self.stream = sd.RawInputStream(samplerate=SR, channels=1, dtype="int16", blocksize=1600, device=device,
-                                        callback=lambda indata, frames, t, status: chunks.append(bytes(indata)))
-        self.stream.start()
+        self.stream, self.name, self.info = open_input(sd, chunks, device)
 
     def terminate(self):
         try:
@@ -206,6 +292,12 @@ class Recorder:
 
     def wait(self):
         pass
+
+
+def probe_mic(device=None):
+    """Really open and close the microphone as recording would. Returns 'name (format)'; raises with every failure."""
+    r = Recorder([], device); r.terminate()
+    return f"{r.name} ({r.info})"
 
 
 def mic_devices():
