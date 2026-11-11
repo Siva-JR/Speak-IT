@@ -8,3 +8,6 @@ results/
 *.bak
 *.bak[0-9]
 .nuvai/
+
+# Auto-added by Nuvai session-start-governance-check
+.DS_Store

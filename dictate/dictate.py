@@ -21,6 +21,8 @@ SR = 16000
 
 DEFAULTS = {
     "model": str(HERE.parent / "models" / "faster-whisper-base.en"), "compute_type": "int8", "beam_size": 2,
+    "device": "auto",            # "cuda" | "cpu" | "auto" (cuda if a GPU is usable, else cpu). Env: DICTATE_DEVICE
+    "gpu_compute_type": "float16",  # compute type used when device is cuda (compute_type applies to cpu)
     "threads": 4, "remove_fillers": True, "auto_gain": True, "chunk_s": 28.0, "min_speech_s": 0.25,
     "halluc_filter": True, "min_window_s": 15.0, "window_step_s": 5.0,
     "worker_linger_s": 30,       # keep the model process this long after the last use, then exit (frees everything)
@@ -32,7 +34,7 @@ DEFAULTS = {
     "type_delay_ms": 6,           # pause between typed characters (terminal UIs mis-handle instant bursts)
     "type_settle_ms": 350,        # wait at least this long after the stop hotkey before typing (modifiers released)
 }
-WORKER_KEYS = ("model", "compute_type", "beam_size", "threads", "remove_fillers", "auto_gain", "chunk_s",
+WORKER_KEYS = ("model", "compute_type", "device", "gpu_compute_type", "beam_size", "threads", "remove_fillers", "auto_gain", "chunk_s",
                "min_speech_s", "halluc_filter", "min_window_s", "window_step_s")
 
 
@@ -42,6 +44,8 @@ def load_config():
     if f.exists():
         cfg.update(tomllib.loads(f.read_text()))
     cfg.update(json.loads(os.environ.get("DICTATE_CFG", "{}")))
+    if os.environ.get("DICTATE_DEVICE"):
+        cfg["device"] = os.environ["DICTATE_DEVICE"]
     return cfg
 
 
@@ -243,7 +247,7 @@ class Worker:
         self.ready, self.lock = threading.Event(), threading.Lock()
         self.results, self.n = {}, 0
         self.last_used, self.busy = time.time(), 0
-        self.load_s, self.started_at = None, 0
+        self.load_s, self.started_at, self.device = None, 0, None
 
     def alive(self):
         return self.p is not None and self.p.poll() is None
@@ -283,7 +287,7 @@ class Worker:
             except Exception:
                 continue
             if d.get("ready"):
-                self.load_s = d.get("load_s"); self.ready.set(); elog("worker_ready", load_s=self.load_s)
+                self.load_s = d.get("load_s"); self.device = d.get("device"); self.ready.set(); elog("worker_ready", load_s=self.load_s)
             elif "job" in d and d["job"] in self.results:
                 ev, _ = self.results[d["job"]]
                 self.results[d["job"]] = (ev, d); ev.set()
@@ -519,7 +523,7 @@ class Daemon:
             return f.read_text() if f.exists() else "(nothing yet)"
         if cmd == "status":
             return json.dumps({"recording": self.recording, "busy": self.busy, "worker_running": self.worker.alive(),
-                               "worker_load_s": self.worker.load_s, "portal_ready": self.typer.ready.is_set(),
+                               "worker_load_s": self.worker.load_s, "device": self.worker.device, "portal_ready": self.typer.ready.is_set(),
                                "portal_error": self.typer.error})
         if cmd == "quit":
             self.worker.stop()
