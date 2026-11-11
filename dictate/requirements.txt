@@ -1,0 +1,4 @@
+faster-whisper>=1.1.1
+psutil
+numpy
+num2words

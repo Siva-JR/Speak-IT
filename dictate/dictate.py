@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local push-to-talk dictation daemon: tiny always-on process + a short-lived model worker.
 
-  dictate serve | toggle | start | stop | status | doctor | quit
+  dictate serve | toggle | start | stop | status | doctor | dashboard | quit
   dictate typetest      type a test phrase after 4 s
   dictate replay FILE   transcribe a 16 kHz mono wav through the full pipeline (no typing)
   dictate memstat       memory of every process in the chain
@@ -67,6 +67,29 @@ def physical_cpus(n):
 # A diary of what the daemon does (never the dictated words): one line per event, size-capped and rotated.
 EVLOG = STATE / "events.log"
 _ev_lock = threading.Lock()
+
+
+def capture_stderr():
+    """Tee fd 2 (daemon + worker tracebacks and warnings) into STATE/errors.log so the dashboard can show them."""
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        log = STATE / "errors.log"
+        if log.exists() and log.stat().st_size > 1_000_000:
+            log.replace(STATE / "errors.log.1")
+        r, w = os.pipe(); orig = os.dup(2); os.dup2(w, 2); os.close(w)
+        def pump():
+            with os.fdopen(r, "rb", 0) as src, open(log, "ab", 0) as dst:
+                buf = b""
+                while chunk := src.read(4096):
+                    try: os.write(orig, chunk)
+                    except OSError: pass
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        dst.write(time.strftime("%Y-%m-%dT%H:%M:%S ").encode() + line + b"\n")
+        threading.Thread(target=pump, daemon=True, name="stderr-tee").start()
+    except Exception as e:
+        sys.stderr.write(f"stderr capture disabled: {e}\n")
 
 
 def elog(kind, **kw):
@@ -644,7 +667,10 @@ def words_cmd(a):
 def main():
     cmd = " ".join(sys.argv[1:]) or "toggle"
     if cmd == "serve":
+        capture_stderr()
         Daemon().serve()
+    elif sys.argv[1:2] == ["dashboard"]:
+        os.execv(sys.executable, [sys.executable, str(HERE / "dashboard.py")] + sys.argv[2:])
     elif cmd == "doctor":
         doctor()
     elif sys.argv[1:2] in (["vocab"], ["replace"], ["fixtest"]):
