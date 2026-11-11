@@ -437,7 +437,8 @@ class Daemon:
         self.target = ""
         if not dry:
             threading.Thread(target=lambda: setattr(self, "target", focus_app()), daemon=True).start()
-        elog("rec_stop", audio_s=round(len(pcm) / (SR * 2), 2), dry=dry or None)
+        elog("rec_stop", audio_s=round(len(pcm) / (SR * 2), 2), dry=dry or None,
+             **(self.rec.stats() if IS_WIN and hasattr(self.rec, "stats") else {}))
         return self.run_job(pcm, time.perf_counter(), dry)
 
     # --- transcribe + deliver
@@ -646,7 +647,8 @@ def doctor_windows():
     for mod, why in (("faster_whisper", "speech model"), ("sounddevice", "microphone"), ("psutil", "stats"), ("numpy", "audio")):
         print(f"[{ok(importlib.util.find_spec(mod))}] python: {mod} ({why})")
     try:
-        print(f"[ok ] microphone: opened {_pw.probe_mic(load_config().get('mic_device'))}")
+        lvl, msg = _pw.selftest_mic(load_config().get("mic_device"))
+        print(f"[{ {'ok': 'ok ', 'warn': 'warn', 'fail': 'FAIL'}[lvl] }] microphone: {msg}")
     except Exception as e:
         print(f"[FAIL] microphone: {e}")
     try:

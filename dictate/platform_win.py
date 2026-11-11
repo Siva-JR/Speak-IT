@@ -169,9 +169,23 @@ def parse_hotkey(spec):
     return mods, key
 
 
+class Debounce:
+    """True at most once per `window` seconds (swallows key bounce / auto-repeat that would toggle twice)."""
+    def __init__(self, window=0.35):
+        self.window, self.last = window, 0.0
+
+    def __call__(self, now=None):
+        now = time.monotonic() if now is None else now
+        if now - self.last < self.window:
+            return False
+        self.last = now
+        return True
+
+
 def start_hotkey(spec, callback, log=lambda *a, **k: None):
     """Register a global hotkey; callback runs on a fresh thread. Returns the listener thread."""
     mods, vk = parse_hotkey(spec)
+    ok_to_fire = Debounce()
 
     def loop():
         u = ctypes.windll.user32
@@ -182,7 +196,7 @@ def start_hotkey(spec, callback, log=lambda *a, **k: None):
         log("hotkey_ok", hotkey=spec)
         msg = wintypes.MSG()
         while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == 0x0312:                                 # WM_HOTKEY
+            if msg.message == 0x0312 and ok_to_fire():                # WM_HOTKEY
                 threading.Thread(target=callback, daemon=True).start()
     t = threading.Thread(target=loop, daemon=True, name="hotkey"); t.start()
     return t
@@ -213,8 +227,9 @@ class Resampler:
 
 def candidate_inputs(sd, spec=None):
     """Input device indices to try, best first. spec: None (auto), an index, or a name substring.
-    Auto order: the system default (if set), then each host API's own default input (default host API first),
-    then every other input. No device names are assumed; the caller just tries them in order."""
+    Auto order: the system default (if set), then each host API's own default input (default host API first).
+    Other inputs (e.g. 'Stereo Mix', which records the speakers) are NOT tried automatically: recording from the wrong
+    source is worse than failing. Choose one explicitly with mic_device. No device names are assumed."""
     devs = sd.query_devices()
     inputs = [i for i, d in enumerate(devs) if d.get("max_input_channels", 0) > 0]
     if not inputs:
@@ -241,15 +256,28 @@ def candidate_inputs(sd, spec=None):
             add(apis[a].get("default_input_device"))
     except Exception:
         pass
-    for i in inputs:
-        add(i)
-    return order
+    return order or inputs          # no default info at all: only then consider every input
 
 
-def open_input(sd, chunks, spec=None):
+class Tap:
+    """What the microphone callback actually did: blocks received, bytes kept, PortAudio status flags, last error."""
+    def __init__(self):
+        self.blocks, self.bytes, self.status, self.error = 0, 0, set(), None
+
+    def summary(self):
+        d = {"mic_blocks": self.blocks, "mic_bytes": self.bytes}
+        if self.status:
+            d["mic_status"] = ",".join(sorted(self.status))[:80]
+        if self.error:
+            d["mic_error"] = self.error[:120]
+        return d
+
+
+def open_input(sd, chunks, spec=None, tap=None):
     """Open the first input that works, in whatever format it supports, appending 16 kHz mono int16 bytes to chunks.
     Returns (running stream, device name, description). Raises one error listing every failure."""
     import numpy as np
+    tap = tap or Tap()
     failures, devs = [], sd.query_devices()
     for idx in candidate_inputs(sd, spec):
         d = devs[idx]
@@ -257,18 +285,27 @@ def open_input(sd, chunks, spec=None):
         formats = [(SR, 1), (native_sr, 1)] + ([(native_sr, int(d["max_input_channels"]))] if d["max_input_channels"] > 1 else [])
         for sr, ch in dict.fromkeys(formats):
             try:
-                if sr == SR and ch == 1:
-                    cb = lambda indata, frames, t, status: chunks.append(bytes(indata))
-                    rs = None
-                else:
-                    rs = Resampler(sr, SR) if sr != SR else None
-                    def cb(indata, frames, t, status, ch=ch, rs=rs):
+                rs = Resampler(sr, SR) if sr != SR else None
+                def inner(indata, ch=ch, rs=rs):
+                    if rs is None and ch == 1:
+                        b = bytes(indata)
+                    else:
                         x = np.frombuffer(indata, dtype=np.int16).astype(np.float32)
                         if ch > 1:
                             x = x.reshape(-1, ch).mean(axis=1)
                         if rs is not None:
                             x = rs.process(x)
-                        chunks.append(np.clip(x, -32768, 32767).astype(np.int16).tobytes())
+                        b = np.clip(x, -32768, 32767).astype(np.int16).tobytes()
+                    chunks.append(b)
+                    return len(b)
+                def cb(indata, frames, t, status, inner=inner):
+                    tap.blocks += 1
+                    if status:
+                        tap.status.add(str(status))
+                    try:
+                        tap.bytes += inner(indata)
+                    except Exception as e:           # never raise inside the audio thread (it would abort the stream)
+                        tap.error = f"{type(e).__name__}: {e}"
                 st = sd.RawInputStream(samplerate=sr, channels=ch, dtype="int16", blocksize=int(sr / 10), device=idx, callback=cb)
                 st.start()
                 return st, d["name"], f"{sr} Hz x{ch}" + (" (converted to 16 kHz mono)" if (sr, ch) != (SR, 1) else "")
@@ -281,8 +318,8 @@ class Recorder:
     """Microphone capture into `chunks`. Same terminate()/wait() shape as the arecord Popen on Linux."""
     def __init__(self, chunks, device=None):
         import sounddevice as sd
-        self.chunks = chunks
-        self.stream, self.name, self.info = open_input(sd, chunks, device)
+        self.chunks, self.tap = chunks, Tap()
+        self.stream, self.name, self.info = open_input(sd, chunks, device, self.tap)
 
     def terminate(self):
         try:
@@ -293,11 +330,26 @@ class Recorder:
     def wait(self):
         pass
 
+    def stats(self):
+        return self.tap.summary()
 
-def probe_mic(device=None):
-    """Really open and close the microphone as recording would. Returns 'name (format)'; raises with every failure."""
-    r = Recorder([], device); r.terminate()
-    return f"{r.name} ({r.info})"
+
+def selftest_mic(device=None, secs=1.0):
+    """Open the microphone, record `secs`, and report whether audio really arrived. Returns (level, message) with
+    level 'ok' | 'warn' | 'fail'. Raises if no microphone can be opened."""
+    chunks = []
+    r = Recorder(chunks, device)
+    time.sleep(secs); r.terminate()
+    s = r.stats(); head = f"{r.name} ({r.info})"
+    if not chunks:
+        return "fail", f"{head}: opened but delivered NO audio ({s}). Check Settings > Privacy & security > Microphone"
+    import numpy as np
+    peak = int(np.abs(np.frombuffer(b"".join(chunks), dtype=np.int16)).max()) if chunks else 0
+    if s.get("mic_error"):
+        return "fail", f"{head}: callback error {s['mic_error']}"
+    if peak < 30:
+        return "warn", f"{head}: audio arrives but it is silent (peak {peak}); is the mic muted or the wrong one?"
+    return "ok", f"{head}: {s['mic_blocks']} blocks, peak {peak}"
 
 
 def mic_devices():

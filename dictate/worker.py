@@ -70,8 +70,13 @@ def trim():
 
 
 def mem():
-    m = _proc.memory_full_info()
-    return {"rss_mb": round(m.rss / 1e6), "pss_mb": round(m.pss / 1e6), "uss_mb": round(m.uss / 1e6)}
+    """RSS/PSS/USS in MB. PSS exists only on Linux; elsewhere it falls back to USS. Stats must never break dictation."""
+    try:
+        m = _proc.memory_full_info()
+        uss = getattr(m, "uss", m.rss)
+        return {"rss_mb": round(m.rss / 1e6), "pss_mb": round(getattr(m, "pss", uss) / 1e6), "uss_mb": round(uss / 1e6)}
+    except Exception:
+        return {}
 
 
 def read_lines(name, default):
