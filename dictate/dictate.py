@@ -9,7 +9,7 @@
 The daemon imports no numpy and no model code (about 10 MB). The model lives in worker.py, which is started when
 you press the hotkey, stays for `worker_linger_s` after the last use, then exits and returns ALL of its memory.
 """
-import json, os, shutil, socket, subprocess, sys, threading, time, tomllib, wave
+import base64, json, os, shutil, socket, subprocess, sys, threading, time, tomllib, wave
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -376,6 +376,8 @@ class Daemon:
         self.worker = Worker(self.cfg)
         self.rec, self.chunks, self.rec_thread, self.t_rec = None, [], None, 0
         self.recording, self.busy, self.jobs = False, False, 0
+        self.last_job, self.last_wav = {}, None            # what the dashboard's live test shows after a run
+        self.test_mode, self.last_poll = False, 0.0        # dashboard live test: auto-stop if the page goes away
         STATE.mkdir(parents=True, exist_ok=True)
 
     def portal_mode(self):
@@ -426,6 +428,8 @@ class Daemon:
         while self.recording and self.t_rec == t0:
             if time.time() - t0 > self.cfg["max_record_s"]:
                 self.stop_rec(); return
+            if self.test_mode and time.time() - self.last_poll > 15:       # dashboard tab closed mid-test
+                elog("test_abandoned"); self.test_mode = False; self.stop_rec(dry=True); return
             time.sleep(0.5)
 
     def stop_rec(self, dry=False):
@@ -451,12 +455,16 @@ class Daemon:
         try:
             if len(pcm) < 0.4 * SR * 2:
                 notify(cfg, "too short, ignored")
+                self.last_job = {"note": "too short (under 0.4 s of audio)", "audio_s": round(len(pcm) / (SR * 2), 2)}
                 return "too short"
             tmp.write_bytes(pcm)
             notify(cfg, "⏳ transcribing…")
             elog("job_start", audio_s=round(len(pcm) / (SR * 2), 2))
             r = self.worker.submit(tmp)
             text = r.get("text", "")
+            self.last_job = {"text": text, "raw": r.get("raw"), "audio_s": r.get("audio_s"), "peak": r.get("peak"),
+                             "rms": r.get("rms"), "asr_s": r.get("asr_s"), "job_s": r.get("job_s"), "note": r.get("note"),
+                             "dropped": len(r.get("dropped") or []), "device": self.worker.device, "load_s": self.worker.load_s}
             slow = bool(r.get("asr_s") and r.get("audio_s") and r["asr_s"] > r["audio_s"])
             elog("job_done", asr_s=r.get("asr_s"), job_s=r.get("job_s"), chars=len(text), threads=getattr(self.worker, "threads", None),
                slow=slow or None, dropped=len(r.get("dropped") or []) or None)
@@ -489,6 +497,7 @@ class Daemon:
             return text
         except Exception as e:
             elog("job_error", error=str(e)[:200])
+            self.last_job = {"error": str(e)[:300]}
             notify(cfg, f"error: {e}", "critical"); cue(cfg, "error")
             return f"error: {e}"
         finally:
@@ -525,6 +534,7 @@ class Daemon:
             (STATE / "last.txt").write_text(rec["text"])          # always keep the latest text: `dictate last`
         if self.cfg["save_audio"]:
             d = STATE / "audio"; d.mkdir(exist_ok=True)
+            self.last_wav = f"{rec['ts'].replace(':', '')}.wav"
             with wave.open(str(d / f"{rec['ts'].replace(':', '')}.wav"), "wb") as w:
                 w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR); w.writeframes(pcm)
             for old in sorted(d.glob("*.wav"))[: -int(self.cfg["keep_audio"])]:
@@ -556,6 +566,32 @@ class Daemon:
             return self.run_job(pcm, time.perf_counter(), dry=True)
         if cmd == "typetest":
             time.sleep(4); self.typer.type("Typing test: The quick brown fox, 123! (A-Z) it's ok? "); return "typed"
+        if cmd == "teststart":                  # dashboard live test: same pipeline as the hotkey, but nothing is typed
+            self.test_mode, self.last_poll = True, time.time()
+            elog("test_start")
+            res = self.start_rec(); ok = res == "recording"
+            if not ok:
+                self.test_mode = False
+            return json.dumps({"ok": ok, "msg": res, "mic": (getattr(self.rec, "name", None) or "system default input (arecord)") if ok else None,
+                               "info": (getattr(self.rec, "info", None) or "16000 Hz x1") if ok else None})
+        if cmd == "level":                      # last ~64 ms of raw samples; the browser draws the spectrum from them
+            self.last_poll = time.time()
+            chunks = self.chunks
+            data = b"".join(chunks[-4:])[-2048:] if self.recording else b""
+            return json.dumps({"rec": self.recording, "secs": round(time.time() - self.t_rec, 1) if self.recording else 0,
+                               "bytes": sum(len(c) for c in chunks) if self.recording else 0,
+                               "s": base64.b64encode(data).decode()})
+        if cmd == "teststop":
+            self.test_mode = False
+            self.last_job, self.last_wav = {}, None
+            msg = self.stop_rec(dry=True)
+            chunks = self.chunks
+            stats = dict(self.rec.stats()) if (IS_WIN and hasattr(self.rec, "stats")) else \
+                {"mic_blocks": len(chunks), "mic_bytes": sum(len(c) for c in chunks)}
+            elog("test_stop", msg=str(msg)[:80])
+            return json.dumps({**self.last_job, **stats, "msg": str(msg), "wav": self.last_wav,
+                               "mic": getattr(self.rec, "name", None) or "system default input (arecord)",
+                               "info": getattr(self.rec, "info", None) or "16000 Hz x1"})
         if cmd == "memstat": return self.memstat()
         if cmd == "events":
             n = int(arg) if arg.isdigit() else 40
