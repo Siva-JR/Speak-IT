@@ -1,0 +1,31 @@
+# VoiceInk-style Whisper settings (read from its LibWhisper.swift): whisper.cpp, GREEDY, temperature 0.2, no context,
+# full 30 s window, English warm-up prompt, threads = min(8, cores-2) = 6 here. Local models only.
+defaults:
+  repeats: 3
+  warmup: 2
+  sample_interval_s: 0.1
+  cooldown_s: 30
+  cooldown_max_temp_c: 60
+  cooldown_timeout_s: 300
+
+targets:
+  rtf: 0.5
+  wer_delta_pp: 1.0
+  rss_mb: 450
+  max_hallucinated_words: 0
+
+base:
+  engine: faster_whisper
+  model: models/faster-whisper-base.en
+  compute_type: float32
+  beam_size: 5
+  threads: 4
+  vad: false
+
+vary: []
+
+candidates:
+  - {name: OURS-fw-int8-b5-vad,  compute_type: int8, vad: true}
+  - {name: vi-base.en,           engine: whisper_cpp, model: models/ggml-base.en.bin, beam_size: 1, threads: 6, temperature: 0.2, initial_prompt: "Hello, how are you doing? Nice to meet you."}
+  - {name: vi-base.en-vad,       engine: whisper_cpp, model: models/ggml-base.en.bin, beam_size: 1, threads: 6, temperature: 0.2, initial_prompt: "Hello, how are you doing? Nice to meet you.", vad: true}
+  - {name: vi-tiny.en,           engine: whisper_cpp, model: models/ggml-tiny.en.bin, beam_size: 1, threads: 6, temperature: 0.2, initial_prompt: "Hello, how are you doing? Nice to meet you."}

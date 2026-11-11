@@ -1,0 +1,32 @@
+# Finalists for the "cool machine" re-run. Baseline = original float32 faster-whisper base.en.
+defaults:
+  repeats: 3
+  warmup: 2
+  sample_interval_s: 0.1
+  cooldown_s: 30
+  cooldown_max_temp_c: 60       # wait until the package is <= 60 C before each candidate
+  cooldown_timeout_s: 300
+
+targets:
+  rtf: 0.5
+  wer_delta_pp: 1.0
+  rss_mb: 450                   # peak RSS incl. Python runtime; PSS/USS reported alongside
+  max_hallucinated_words: 0
+
+base:
+  engine: faster_whisper
+  model: models/faster-whisper-base.en
+  compute_type: float32
+  beam_size: 5
+  threads: 4
+  vad: false
+
+vary: []
+
+candidates:
+  - {name: fw-int8,             compute_type: int8}
+  - {name: fw-int8-vad,         compute_type: int8, vad: true}
+  - {name: cpp-q5-ctx768,       engine: whisper_cpp, model: models/ggml-base.en-q5_1.bin, beam_size: 1, audio_ctx: 768}
+  - {name: cpp-q5-ctx768-vad,   engine: whisper_cpp, model: models/ggml-base.en-q5_1.bin, beam_size: 1, audio_ctx: 768, vad: true}
+  - {name: cpp-q5-ctx768-b5-vad, engine: whisper_cpp, model: models/ggml-base.en-q5_1.bin, beam_size: 5, audio_ctx: 768, vad: true}
+  - {name: cpp-q8-ctx768-vad,   engine: whisper_cpp, model: models/ggml-base.en-q8_0.bin, beam_size: 1, audio_ctx: 768, vad: true}

@@ -1,0 +1,32 @@
+# Streaming simulation candidates. final_latency = end of speech -> final text (incl. endpoint delay).
+defaults:
+  cooldown_s: 15
+  cooldown_max_temp_c: 60
+  cooldown_timeout_s: 300
+
+streams:
+  - name: fw-int8-rolling-0.5
+    policy: rolling
+    step: 0.5
+    endpoint_s: 0.4
+    engine: {name: x, engine: faster_whisper, model: models/faster-whisper-base.en, compute_type: int8, beam_size: 5, threads: 4}
+  - name: fw-int8-commit-0.5
+    policy: commit
+    step: 0.5
+    endpoint_s: 0.4
+    engine: {name: x, engine: faster_whisper, model: models/faster-whisper-base.en, compute_type: int8, beam_size: 5, threads: 4}
+  - name: fw-int8-commit-1.0
+    policy: commit
+    step: 1.0
+    endpoint_s: 0.4
+    engine: {name: x, engine: faster_whisper, model: models/faster-whisper-base.en, compute_type: int8, beam_size: 5, threads: 4}
+  - name: fw-int8-greedy-commit-0.5
+    policy: commit
+    step: 0.5
+    endpoint_s: 0.4
+    engine: {name: x, engine: faster_whisper, model: models/faster-whisper-base.en, compute_type: int8, beam_size: 1, threads: 4}
+  - name: cpp-q5-ctx768-rolling-0.5
+    policy: rolling
+    step: 0.5
+    endpoint_s: 0.4
+    engine: {name: x, engine: whisper_cpp, model: models/ggml-base.en-q5_1.bin, beam_size: 1, threads: 4, audio_ctx: 768}

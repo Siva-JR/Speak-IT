@@ -1,0 +1,11 @@
+faster-whisper>=1.1.1
+psutil
+jiwer
+soundfile
+numpy
+pyyaml
+huggingface_hub
+pandas
+matplotlib
+tabulate
+num2words
