@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-shot setup for the dictation tool. Safe to re-run. Reverse with ./uninstall.sh
 #   Linux : venv + deps + model + systemd user service + GNOME hotkey + checks
-#   macOS / Windows (Git Bash/WSL): venv + deps + model + dashboard only. The daemon is Linux-only for now.
+#   Windows (Git Bash / MSYS2): hands over to install.ps1 (venv, deps, model, startup shortcut, hotkey daemon)
+#   macOS : venv + deps + model + dashboard only (daemon not ported yet)
 # Env: DICTATE_HOTKEY (default <Control><Alt>space)   DICTATE_MODEL (default base.en)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -24,6 +25,11 @@ find_python() {
   return 1
 }
 venv_python() { for p in "$VENV/bin/python" "$VENV/Scripts/python.exe" "$VENV/Scripts/python"; do [ -f "$p" ] && { echo "$p"; return; }; done; }
+
+if [ "$OS" = windows ]; then
+  say "Windows: handing over to install.ps1"
+  exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$HERE/install.ps1" 2>/dev/null || echo "$HERE/install.ps1")"
+fi
 
 say "1/5 Python environment ($OS)"
 PYBIN="$(venv_python || true)"

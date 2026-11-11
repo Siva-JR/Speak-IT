@@ -13,10 +13,8 @@ import json, os, shutil, socket, subprocess, sys, threading, time, tomllib, wave
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
-SOCK = os.environ.get("DICTATE_SOCK", str(RUNTIME / "dictate.sock"))
-CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dictate"
-STATE = Path(os.environ.get("DICTATE_STATE", Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "dictate"))
+sys.path.insert(0, str(HERE))
+from common import (IS_WIN, RUNTIME, SOCK, CONF_DIR, STATE, START_HINT, ctl_listen, ctl_request, ctl_unpack)
 SR = 16000
 
 DEFAULTS = {
@@ -33,7 +31,11 @@ DEFAULTS = {
     "pin_threads": True,          # one engine thread per PHYSICAL core, sleeping (not spinning) waits: ~40% less CPU
     "type_delay_ms": 6,           # pause between typed characters (terminal UIs mis-handle instant bursts)
     "type_settle_ms": 350,        # wait at least this long after the stop hotkey before typing (modifiers released)
+    "hotkey": "ctrl+alt+space",   # Windows only: global hotkey the daemon registers itself (Linux uses the GNOME shortcut)
+    "mic_device": None,           # Windows only: sounddevice input device name or index (None = system default)
 }
+if IS_WIN:
+    DEFAULTS["tray"] = False      # no tray icon on Windows yet; beeps signal start/done/error
 WORKER_KEYS = ("model", "compute_type", "device", "gpu_compute_type", "beam_size", "threads", "remove_fillers", "auto_gain", "chunk_s",
                "min_speech_s", "halluc_filter", "min_window_s", "window_step_s")
 
@@ -72,6 +74,7 @@ _ev_lock = threading.Lock()
 def capture_stderr():
     """Tee fd 2 (daemon + worker tracebacks and warnings) into STATE/errors.log so the dashboard can show them."""
     try:
+        os.fstat(2)                                         # no valid stderr (pythonw): nothing to tee
         STATE.mkdir(parents=True, exist_ok=True)
         log = STATE / "errors.log"
         if log.exists() and log.stat().st_size > 1_000_000:
@@ -89,7 +92,8 @@ def capture_stderr():
                         dst.write(time.strftime("%Y-%m-%dT%H:%M:%S ").encode() + line + b"\n")
         threading.Thread(target=pump, daemon=True, name="stderr-tee").start()
     except Exception as e:
-        sys.stderr.write(f"stderr capture disabled: {e}\n")
+        try: sys.stderr.write(f"stderr capture disabled: {e}\n")
+        except Exception: pass
 
 
 def elog(kind, **kw):
@@ -263,6 +267,12 @@ def clipboard_set(text):
     return None
 
 
+if IS_WIN:      # swap the Linux-specific helpers above for their Windows versions; the Daemon code is shared
+    import platform_win as _pw
+    notify, cue, focus_app, clipboard_set = _pw.notify, _pw.cue, _pw.focus_app, _pw.clipboard_set
+    idle_cpus, proc_mem, PortalTyper = _pw.idle_cpus, _pw.proc_mem, _pw.Typer
+
+
 # ----------------------------------------------------------------------------- model worker
 class Worker:
     def __init__(self, cfg):
@@ -376,9 +386,17 @@ class Daemon:
         if self.recording:
             return "already recording"
         self.chunks = []
-        self.rec = subprocess.Popen(["arecord", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(SR), "-c", "1", "-"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self.rec_thread = threading.Thread(target=self._pump, daemon=True); self.rec_thread.start()
+        if IS_WIN:
+            try:
+                self.rec = _pw.Recorder(self.chunks, self.cfg.get("mic_device"))
+            except Exception as e:
+                elog("job_error", error=f"microphone: {e}"[:200]); cue(self.cfg, "error")
+                return f"error: microphone: {e}"
+            self.rec_thread = threading.Thread(target=lambda: None); self.rec_thread.start()
+        else:
+            self.rec = subprocess.Popen(["arecord", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(SR), "-c", "1", "-"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.rec_thread = threading.Thread(target=self._pump, daemon=True); self.rec_thread.start()
         self.recording, self.t_rec = True, time.time()
         elog("rec_start", portal_ready=self.typer.ready.is_set())
         threading.Thread(target=self._cpu_watch, daemon=True).start()       # is the machine busy? (picks engine threads)
@@ -584,14 +602,18 @@ class Daemon:
                 elog("portal_up", down_s=round(time.time() - self._portal_down, 1)); self._portal_down = None
 
     def serve(self):
-        if os.path.exists(SOCK):
-            os.unlink(SOCK)
-        s = socket.socket(socket.AF_UNIX); s.bind(SOCK); s.listen(4); os.chmod(SOCK, 0o600)
+        s = ctl_listen()
         threading.Thread(target=self.worker.linger_watch, args=(lambda: self.recording,), daemon=True).start()
-        if self.portal_mode():
-            self.typer.start()
-            threading.Thread(target=self.portal_watch, daemon=True).start()
-        threading.Thread(target=self.screen_watch, daemon=True).start()
+        if IS_WIN:
+            try:
+                _pw.start_hotkey(self.cfg["hotkey"], lambda: self.handle("toggle"), elog)
+            except ValueError as e:
+                elog("hotkey_fail", error=str(e)); sys.stderr.write(f"{e}\n")
+        else:
+            if self.portal_mode():
+                self.typer.start()
+                threading.Thread(target=self.portal_watch, daemon=True).start()
+            threading.Thread(target=self.screen_watch, daemon=True).start()
         elog("daemon_start", pid=os.getpid(), beam=self.cfg["beam_size"], threads=self.cfg["threads"], output=self.cfg["output"])
         print("dictate daemon ready", flush=True)
         while True:
@@ -600,7 +622,9 @@ class Daemon:
 
     def _client(self, c):
         try:
-            cmd = c.recv(1024).decode().strip()
+            cmd = ctl_unpack(c.recv(1024))
+            if cmd is None:
+                c.sendall(b"unauthorized"); return
             if cmd in ("toggle", "stop") and self.recording:          # answer the hotkey instantly
                 threading.Thread(target=self.handle, args=(cmd,), daemon=True).start()
                 c.sendall(b"processing")
@@ -612,12 +636,38 @@ class Daemon:
 
 # ----------------------------------------------------------------------------- client / doctor
 def send(cmd, timeout=60):
-    c = socket.socket(socket.AF_UNIX); c.settimeout(timeout)
-    c.connect(SOCK); c.sendall(cmd.encode())
-    return c.recv(65536).decode()
+    return ctl_request(cmd, timeout)
+
+
+def doctor_windows():
+    import importlib.util
+    ok = lambda b: "ok " if b else "FAIL"
+    print(f"[{ok(Path(DEFAULTS['model']).exists())}] model: {DEFAULTS['model']}")
+    for mod, why in (("faster_whisper", "speech model"), ("sounddevice", "microphone"), ("psutil", "stats"), ("numpy", "audio")):
+        print(f"[{ok(importlib.util.find_spec(mod))}] python: {mod} ({why})")
+    try:
+        devs = _pw.mic_devices()
+        print(f"[{ok(devs)}] microphone: {devs[0] if devs else 'no input device found (Settings > Privacy > Microphone)'}")
+    except Exception as e:
+        print(f"[FAIL] microphone: {e}")
+    try:
+        _pw.parse_hotkey(DEFAULTS["hotkey"]); print(f"[ok ] hotkey: {load_config()['hotkey']}")
+    except ValueError as e:
+        print(f"[FAIL] {e}")
+    try:
+        import ctranslate2
+        print(f"[{'ok ' if ctranslate2.get_cuda_device_count() else 'warn'}] CUDA GPUs: {ctranslate2.get_cuda_device_count()} (0 = runs on CPU)")
+    except Exception as e:
+        print(f"[warn] ctranslate2: {e}")
+    try:
+        print("[ok ] daemon:", send("status", 5))
+    except Exception as e:
+        print(f"[FAIL] daemon not running ({e})  ->  {START_HINT}")
 
 
 def doctor():
+    if IS_WIN:
+        return doctor_windows()
     ok = lambda b: "ok " if b else "FAIL"
     print(f"[{ok(Path(DEFAULTS['model']).exists())}] model: {DEFAULTS['model']}")
     print(f"[{ok(shutil.which('arecord'))}] arecord (microphone capture)")
@@ -631,7 +681,7 @@ def doctor():
     try:
         print("[ok ] daemon:", send("status", 5))
     except Exception as e:
-        print(f"[FAIL] daemon not running ({e})  ->  systemctl --user start dictate")
+        print(f"[FAIL] daemon not running ({e})  ->  {START_HINT}")
 
 
 def words_cmd(a):
@@ -679,8 +729,8 @@ def main():
         try:
             print(send(cmd, 300 if cmd.startswith(("replay", "typetest", "warm")) else 15))
         except (FileNotFoundError, ConnectionRefusedError):
-            notify({"notify": True}, "daemon not running: systemctl --user start dictate", "critical")
-            print("daemon not running: systemctl --user start dictate", file=sys.stderr)
+            notify({"notify": True, "sounds": True}, f"daemon not running: {START_HINT}", "critical")
+            print(f"daemon not running: {START_HINT}", file=sys.stderr)
             sys.exit(1)
 
 

@@ -13,7 +13,7 @@ import math
 import textfix
 HERE = Path(__file__).resolve().parent
 SR = 16000
-CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dictate"
+from common import CONF_DIR, IS_WIN
 CFG = {"model": str(HERE.parent / "models" / "faster-whisper-base.en"), "compute_type": "int8", "device": "cpu", "gpu_compute_type": "float16", "beam_size": 2,
        "threads": 4, "remove_fillers": True, "auto_gain": True, "chunk_s": 28.0, "min_speech_s": 0.25,
        "min_speech_rms": 0.025, "halluc_filter": True,
@@ -173,6 +173,8 @@ class Host:
         want = str(CFG["device"]).lower()
         if want in ("cuda", "gpu", "auto"):
             try:
+                if IS_WIN:
+                    import platform_win; platform_win.add_cuda_dll_dirs()
                 import ctranslate2
                 if ctranslate2.get_cuda_device_count() < 1:
                     raise RuntimeError("no CUDA device")

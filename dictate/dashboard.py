@@ -11,13 +11,12 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 HERE = Path(__file__).resolve().parent
-STATE = Path(os.environ.get("DICTATE_STATE", Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "dictate"))
-CONF = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dictate"
-SOCK = os.environ.get("DICTATE_SOCK", str(Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "dictate.sock"))
+sys.path.insert(0, str(HERE))
+from common import STATE, CONF_DIR as CONF, OS_NAME, ctl_request
 MODEL = HERE.parent / "models" / "faster-whisper-base.en"
 BAD_EVENTS = {"job_error", "type_fail", "portal_down", "deliver_fallback", "screen_watch_error",
               "portal_session_lost", "worker_restart"}
-OS = {"Linux": "linux", "Darwin": "mac", "Windows": "windows"}.get(platform.system(), "other")
+OS = OS_NAME
 
 
 def tail_lines(path, n):
@@ -54,11 +53,8 @@ def history(n, redact):
 
 
 def daemon_status():
-    if not hasattr(socket, "AF_UNIX"):
-        return {"reachable": False, "why": f"this OS ({OS}) has no unix sockets; the daemon is not ported yet"}
     try:
-        c = socket.socket(socket.AF_UNIX); c.settimeout(2); c.connect(SOCK); c.sendall(b"status")
-        return {"reachable": True, "status": json.loads(c.recv(65536).decode())}
+        return {"reachable": True, "status": json.loads(ctl_request("status", 2))}
     except Exception as e:
         return {"reachable": False, "why": f"{type(e).__name__}: {e}"}
 
@@ -89,13 +85,22 @@ def checks():
     for p in ("faster_whisper", "numpy", "psutil", "num2words"):
         add(f"python: {p}", pkg(p), "pip install " + p.replace("_", "-"))
     add("python >= 3.11", sys.version_info >= (3, 11), sys.version.split()[0])
-    tools = {"linux": ["arecord", "pw-play", "notify-send"], "mac": ["afplay", "osascript", "pbcopy", "sox", "ffmpeg"],
-             "windows": ["powershell", "ffmpeg"]}.get(OS, [])
+    tools = {"linux": ["arecord", "pw-play", "notify-send"], "mac": ["afplay", "osascript", "pbcopy"]}.get(OS, [])
     for t in tools:
         add(f"tool: {t}", shutil.which(t), "needed for mic capture / sound cues / notifications / typing", "warn")
     if OS == "linux":
         add("session: wayland", os.environ.get("XDG_SESSION_TYPE") == "wayland", os.environ.get("XDG_SESSION_TYPE") or "unset", "warn")
         add("keyboard permission token", (CONF / "portal_token").exists(), "approve the GNOME prompt on first start")
+    if OS == "windows":
+        add("python: sounddevice", pkg("sounddevice"), "pip install sounddevice (microphone)")
+        try:
+            import platform_win
+            devs = platform_win.mic_devices()
+            add("microphone device", devs, devs[0] if devs else "none found: Settings > Privacy > Microphone, and check the default input")
+        except Exception as e:
+            add("microphone device", False, f"{type(e).__name__}: {e}")
+        add("startup shortcut", (Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup/Dictate.lnk").exists(),
+            "created by install.ps1 (daemon starts at login)", "warn")
     d = daemon_status()
     add("daemon reachable", d["reachable"], d.get("why", "ok"))
     cu = cuda_info()

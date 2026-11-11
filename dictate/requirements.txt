@@ -2,3 +2,4 @@ faster-whisper>=1.1.1
 psutil
 numpy
 num2words
+sounddevice; sys_platform == "win32" or sys_platform == "darwin"
