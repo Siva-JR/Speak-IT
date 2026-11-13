@@ -29,6 +29,26 @@ Logs: `events.log` (what the daemon did) and `errors.log` (tracebacks), in the s
 
 Pressing the hotkey twice within 0.35 s is treated as one press (key bounce protection), so double-tapping it is ignored.
 
+## Hold-to-talk, cancel and undo
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Linux: holding the hotkey does not stop when I let go; it only toggles | The daemon cannot read the keyboard state. `dictate doctor` shows `hold-to-talk / key state` as `warn` | `sudo usermod -aG input $USER`, log out and in, restart the daemon. Without it, typing also waits the fixed `type_settle_ms` |
+| It stops as soon as I start talking | `hotkey_mode = "hold"` and you tapped instead of holding | Use `"auto"` (tap or hold) |
+| A quick press is taken as hold | `hold_threshold_s` is too low for how you press | Raise it, e.g. `0.6` |
+| Cancel / undo hotkeys do nothing (Linux) | The GNOME shortcuts were added by a newer installer | Re-run `./dictate/install.sh`, or bind keys to `dictate cancel` and `dictate undo` |
+| Undo says `focus moved from X to Y` | Undo only deletes in the app it typed into | Click back into that app and undo again |
+| Undo says `already sent with Enter` / `too old` | The text was submitted, or more than `undo_window_s` passed | Delete it by hand |
+| Undo deleted more or less than the dictation | You typed in the same field after dictating; undo presses Backspace once per character it typed | Undo right after dictating |
+
+## Formatting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No capital letter / no full stop in my terminal | The `terminal` profile does that for shells and agents | `[profiles.terminal]` with `capitalize = true` and/or `final_period = "keep"` |
+| An app gets the wrong profile | Its name is not (or wrongly) listed | Find its name in the dashboard's History (or `target=` in `events.log`) and add it to a profile's `apps` |
+| Enter was pressed unexpectedly | A phrase in `enter_phrases` was said at the end | Choose a phrase you do not say naturally, or remove it |
+
 ## The microphone
 
 | Symptom | Cause | Fix |
@@ -50,6 +70,8 @@ later in the chain.
 | `GPU unavailable (no CUDA device); falling back to CPU` | No NVIDIA GPU or CUDA libraries | Informational: it runs on the CPU. Install the NVIDIA driver / CUDA wheels to use the GPU, or set `device = "cpu"` to silence it. |
 | "no speech detected" | The speech gate found only quiet noise (shown with peak/rms) | Speak louder/closer; check the microphone as above |
 | The first dictation takes several seconds | The model loads when you first press the hotkey; it stays loaded for `worker_linger_s` (30 s) | Normal; `dictate warm` pre-loads it |
+| Long dictations: a word near the middle differs from what a re-run gives | Live transcription cut the audio at a pause there | Expected occasionally; `live_transcribe = false` transcribes the whole recording at the end (slower after stop) |
+| `live_error` in Problems | A live transcription step failed | The final transcription still covers the whole recording; check `errors.log` |
 | `transcription timed out` | The machine was fully busy | Adaptive threads handle most cases; close heavy programs or raise `worker_linger_s` |
 
 ## Text is not typed
@@ -71,7 +93,9 @@ later in the chain.
 | `daemon_start`, `hotkey_ok` / `hotkey_fail` | daemon started; Windows hotkey registered or refused |
 | `rec_start mic=...`, `rec_stop audio_s=... mic_blocks=... mic_bytes=...` | recording began/ended; on Windows the counters show whether the microphone delivered audio |
 | `worker_spawn`, `worker_ready load_s=...`, `worker_exit` | model process lifecycle (`worker_exit` after the idle timeout is normal) |
-| `job_done asr_s=... job_s=...`, `job_error error=...` | transcription finished or failed |
+| `job_done asr_s=... tail_asr_s=... live_s=...`, `job_error error=...` | transcription finished (`live_s`: seconds transcribed while you spoke, `tail_asr_s`: work left after stop) or failed |
+| `hold_release held_s=...` | hold-to-talk: the hotkey was let go and the recording stopped |
+| `cancel`, `job_cancelled`, `undo chars=...`, `undo_refused why=...` | cancel and undo |
 | `type_done`, `type_fail`, `deliver_fallback` | text typed, typing failed, fell back to clipboard/file |
 | `test_start`, `test_stop`, `test_abandoned` | dashboard live test |
 
