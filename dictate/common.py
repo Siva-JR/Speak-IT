@@ -69,6 +69,9 @@ def ctl_request(cmd, timeout=60):
         c = socket.socket(socket.AF_UNIX); c.settimeout(timeout)
         c.connect(SOCK); c.sendall(cmd.encode())
     try:
-        return c.recv(65536).decode()
+        parts = []                                       # the daemon closes the connection after its reply
+        while chunk := c.recv(65536):
+            parts.append(chunk)
+        return b"".join(parts).decode()
     finally:
         c.close()

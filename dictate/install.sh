@@ -4,12 +4,15 @@
 #   Windows (Git Bash / MSYS2): hands over to install.ps1 (venv, deps, model, startup shortcut, hotkey daemon)
 #   macOS : venv + deps + model + dashboard only (daemon not ported yet)
 # Env: DICTATE_HOTKEY (default <Control><Alt>space)   DICTATE_MODEL (default base.en)
+#      DICTATE_CANCEL_HOTKEY (default <Control><Alt>BackSpace)   DICTATE_UNDO_HOTKEY (default <Control><Alt>z)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 VENV="$ROOT/.venv"
 MODEL="${DICTATE_MODEL:-base.en}"
 HOTKEY="${DICTATE_HOTKEY:-<Control><Alt>space}"
+CANCEL_HOTKEY="${DICTATE_CANCEL_HOTKEY:-<Control><Alt>BackSpace}"
+UNDO_HOTKEY="${DICTATE_UNDO_HOTKEY:-<Control><Alt>z}"
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m[warn]\033[0m %s\n' "$*"; }
 die() { printf '\033[31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -109,24 +112,30 @@ systemctl --user enable dictate.service
 systemctl --user restart dictate.service
 
 if command -v gsettings >/dev/null && [ -n "${XDG_CURRENT_DESKTOP:-}" ] && [[ "$XDG_CURRENT_DESKTOP" == *GNOME* ]]; then
-  KEYPATH=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dictate/
   SCHEMA=org.gnome.settings-daemon.plugins.media-keys
-  CUR="$(gsettings get $SCHEMA custom-keybindings)"
-  NEW="$(python3 - "$CUR" "$KEYPATH" <<'PY'
+  bind() {   # bind <id> <name> <command> <keys>
+    local KEYPATH=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/$1/
+    local CUR NEW
+    CUR="$(gsettings get $SCHEMA custom-keybindings)"
+    NEW="$(python3 - "$CUR" "$KEYPATH" <<'PY'
 import ast, sys
 cur = ast.literal_eval(sys.argv[1].replace("@as ", ""))
 if sys.argv[2] not in cur: cur.append(sys.argv[2])
 print(cur)
 PY
 )"
-  gsettings set $SCHEMA custom-keybindings "$NEW"
-  K="$SCHEMA.custom-keybinding:$KEYPATH"
-  gsettings set "$K" name 'Dictate'
-  gsettings set "$K" command "$HOME/.local/bin/dictate toggle"
-  gsettings set "$K" binding "$HOTKEY"
-  echo "hotkey: $HOTKEY  ->  dictate toggle"
+    gsettings set $SCHEMA custom-keybindings "$NEW"
+    local K="$SCHEMA.custom-keybinding:$KEYPATH"
+    gsettings set "$K" name "$2"
+    gsettings set "$K" command "$3"
+    gsettings set "$K" binding "$4"
+    echo "hotkey: $4  ->  $3"
+  }
+  bind dictate 'Dictate' "$HOME/.local/bin/dictate toggle" "$HOTKEY"
+  bind dictate-cancel 'Dictate: cancel' "$HOME/.local/bin/dictate cancel" "$CANCEL_HOTKEY"
+  bind dictate-undo 'Dictate: undo last' "$HOME/.local/bin/dictate undo" "$UNDO_HOTKEY"
 else
-  warn "not GNOME: bind a key of your choice to:  $HOME/.local/bin/dictate toggle"
+  warn "not GNOME: bind keys of your choice to:  $HOME/.local/bin/dictate toggle | cancel | undo"
 fi
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) warn "add ~/.local/bin to your PATH to use the 'dictate' command" ;; esac
 
@@ -135,7 +144,11 @@ sleep 2
 "$HOME/.local/bin/dictate" doctor || true
 cat <<DONE
 
-Done. Press $HOTKEY to start/stop dictating (first start shows a one-time
-"allow remote control / keyboard" prompt: approve it).
+Done. Press $HOTKEY to start/stop dictating, or hold it while you talk (first start shows a one-time
+"allow remote control / keyboard" prompt: approve it). $CANCEL_HOTKEY cancels, $UNDO_HOTKEY removes the last text.
 Debug dashboard:  dictate dashboard
 DONE
+if ! id -nG | tr ' ' '\n' | grep -qx input; then
+  warn "hold-to-talk (and typing as soon as you let go of the keys) needs read access to the keyboard state:"
+  echo "       sudo usermod -aG input \$USER   then log out and back in. Without it the hotkey only toggles."
+fi

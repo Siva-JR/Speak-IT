@@ -79,4 +79,6 @@ Done. Click into any text field, press Ctrl+Alt+Space, speak, press it again to 
   - Command:    $Here\dictate.cmd status | doctor | last | dashboard
   - Dashboard:  $Here\dictate.cmd dashboard     (logs, errors, checks: send me 'Copy diagnostics' if something fails)
   - Change hotkey/device: %APPDATA%\dictate\config.toml   (hotkey = "ctrl+shift+space", device = "cpu")
+  - Tap the hotkey to start/stop, or hold it while you talk. Ctrl+Alt+Backspace cancels, Ctrl+Alt+Z removes the
+    last dictated text (cancel_hotkey / undo_hotkey in config.toml). A red dot at the top of the screen = listening.
 "@

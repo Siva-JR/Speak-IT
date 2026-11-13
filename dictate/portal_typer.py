@@ -1,7 +1,8 @@
 #!/usr/bin/python3
 """Types text into the focused window on GNOME/Wayland through the xdg RemoteDesktop portal.
 Runs under the SYSTEM python (needs PyGObject). Protocol, one JSON object per stdin line:
-    {"text": "hello"}  -> types it, replies "DONE <n>"
+    {"text": "hello", "delay_ms": 6}  -> types it (delay_ms optional), replies "DONE <n>"
+    {"key": "enter"|"backspace", "n": 3}  -> presses that key n times, replies "DONE <n>"
 First line printed: "READY" or "ERROR <msg>". A one-time permission dialog appears on first run;
 the restore token is saved so later runs are silent."""
 import json
@@ -75,7 +76,20 @@ def key(session, keysym, down):
 DELAY = float(os.environ.get("DICTATE_TYPE_DELAY_MS", "6")) / 1000
 
 
-def type_text(session, text):
+KEYS = {"enter": 0xff0d, "backspace": 0xff08}
+
+
+def press(session, name, n):
+    ks = KEYS[name]
+    for _ in range(max(0, int(n))):
+        key(session, ks, True)
+        key(session, ks, False)
+        time.sleep(max(DELAY, 0.004))
+    return n
+
+
+def type_text(session, text, delay=None):
+    delay = DELAY if delay is None else delay
     n = 0
     for ch in text:
         if ch in "\r\n":
@@ -87,7 +101,7 @@ def type_text(session, text):
         key(session, ks, True)
         key(session, ks, False)
         n += 1
-        time.sleep(DELAY)                 # pace the keys: Ink/readline TUIs mis-handle instant bursts
+        time.sleep(delay)                 # pace the keys: Ink/readline TUIs mis-handle instant bursts
     return n
 
 
@@ -101,7 +115,11 @@ def main():
     for line in sys.stdin:
         try:
             msg = json.loads(line)
-            print(f"DONE {type_text(session, msg['text'])}", flush=True)
+            if "key" in msg:
+                print(f"DONE {press(session, msg['key'], msg.get('n', 1))}", flush=True)
+            else:
+                d = msg.get("delay_ms")
+                print(f"DONE {type_text(session, msg['text'], None if d is None else float(d) / 1000)}", flush=True)
         except Exception as e:
             print(f"ERROR {e}", flush=True)
             if any(k in str(e).lower() for k in ("closed", "does not exist", "no such")):

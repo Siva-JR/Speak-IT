@@ -37,7 +37,8 @@ class INPUT(ctypes.Structure):
 
 
 INPUT_KEYBOARD, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE = 1, 0x0002, 0x0004
-VK_RETURN, VK_TAB = 0x0D, 0x09
+VK_RETURN, VK_TAB, VK_BACK = 0x0D, 0x09, 0x08
+SPECIAL_KEYS = {"enter": VK_RETURN, "backspace": VK_BACK}
 
 
 def utf16_units(text):
@@ -80,9 +81,16 @@ class Typer:
     def restart(self, why="retry"):
         pass
 
-    def type(self, text):
+    def type(self, text, delay_ms=None):
+        self._send(_key_events(text), self.delay if delay_ms is None else delay_ms / 1000)
+
+    def key(self, name, n=1):
+        """Press 'enter' or 'backspace' n times."""
+        self._send([(SPECIAL_KEYS[name], 0, False)] * max(0, int(n)), max(self.delay, 0.004))
+
+    def _send(self, events, delay):
         u = _user32()
-        for vk, unit, uni in _key_events(text):
+        for vk, unit, uni in events:
             flags = KEYEVENTF_UNICODE if uni else 0
             down, up = INPUT(type=INPUT_KEYBOARD), INPUT(type=INPUT_KEYBOARD)
             down.ki = KEYBDINPUT(vk, unit, flags, 0, 0)
@@ -91,8 +99,8 @@ class Typer:
             if u.SendInput(2, arr, ctypes.sizeof(INPUT)) != 2:
                 raise RuntimeError(f"SendInput failed (error {ctypes.get_last_error() or ctypes.GetLastError()}); "
                                    "the focused window may be running as administrator")
-            if self.delay:
-                time.sleep(self.delay)
+            if delay:
+                time.sleep(delay)
 
 
 # ----------------------------------------------------------------------------- clipboard / focus
@@ -182,24 +190,145 @@ class Debounce:
         return True
 
 
-def start_hotkey(spec, callback, log=lambda *a, **k: None):
-    """Register a global hotkey; callback runs on a fresh thread. Returns the listener thread."""
-    mods, vk = parse_hotkey(spec)
-    ok_to_fire = Debounce()
+def start_hotkeys(binds, log=lambda *a, **k: None):
+    """Register global hotkeys [(spec, callback), ...]; each callback runs on a fresh thread. Specs are checked
+    first (ValueError names the bad one). A hotkey another program already owns is logged and skipped."""
+    parsed = [(spec, *parse_hotkey(spec), cb) for spec, cb in binds if spec]
 
     def loop():
         u = ctypes.windll.user32
-        if not u.RegisterHotKey(None, 1, mods | 0x4000, vk):        # MOD_NOREPEAT
-            err = ctypes.GetLastError()
-            msg = f"could not register hotkey {spec} (error {err}); it is probably used by another program"
-            log("hotkey_fail", error=msg); sys.stderr.write(msg + "\n"); return
-        log("hotkey_ok", hotkey=spec)
+        handlers = {}
+        for i, (spec, mods, vk, cb) in enumerate(parsed, start=1):
+            if not u.RegisterHotKey(None, i, mods | 0x4000, vk):            # MOD_NOREPEAT
+                err = ctypes.GetLastError()
+                msg = f"could not register hotkey {spec} (error {err}); it is probably used by another program"
+                log("hotkey_fail", error=msg); sys.stderr.write(msg + "\n"); continue
+            handlers[i] = (cb, Debounce())
+            log("hotkey_ok", hotkey=spec)
+        if not handlers:
+            return
         msg = wintypes.MSG()
         while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == 0x0312 and ok_to_fire():                # WM_HOTKEY
-                threading.Thread(target=callback, daemon=True).start()
+            if msg.message == 0x0312 and msg.wParam in handlers:            # WM_HOTKEY
+                cb, ok_to_fire = handlers[msg.wParam]
+                if ok_to_fire():
+                    threading.Thread(target=cb, daemon=True).start()
     t = threading.Thread(target=loop, daemon=True, name="hotkey"); t.start()
     return t
+
+
+def start_hotkey(spec, callback, log=lambda *a, **k: None):
+    return start_hotkeys([(spec, callback)], log)
+
+
+# ----------------------------------------------------------------------------- on-screen indicator
+INDICATOR_SIZE = 14
+_COLORS = {"rec": 0x002828E0, "busy": 0x0000A0F0, "error": 0x002828E0}   # COLORREF is 0x00BBGGRR: red, amber
+_KEY = 0x00FF00FF                                                         # magenta = transparent
+
+
+class PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [("hdc", wintypes.HANDLE), ("fErase", wintypes.BOOL), ("rcPaint", wintypes.RECT),
+                ("fRestore", wintypes.BOOL), ("fIncUpdate", wintypes.BOOL), ("rgbReserved", ctypes.c_byte * 32)]
+
+
+class Indicator:
+    """A small red dot at the top centre of the screen while recording (amber while transcribing), hidden when idle:
+    the Windows counterpart of the Linux top-bar icon. Topmost, click-through, never takes focus. (A notification-area
+    icon would land in the hidden overflow on Windows 11, so it would not be seen.) Same set(state) as the Linux Tray."""
+    def __init__(self, enabled=True):
+        self.proc, self.hwnd, self.state = None, None, "idle"
+        if enabled:
+            ready = threading.Event()
+            threading.Thread(target=self._run, args=(ready,), daemon=True, name="indicator").start()
+            ready.wait(3)
+
+    def set(self, state):
+        self.state = state
+        if self.hwnd:
+            try:
+                ctypes.windll.user32.PostMessageW(self.hwnd, 0x8000, 0, 0)      # WM_APP: show/hide/repaint
+            except Exception:
+                pass
+
+    def _run(self, ready):
+        try:
+            self._loop(ready)
+        except Exception as e:
+            sys.stderr.write(f"indicator disabled: {e}\n"); ready.set()
+
+    def _loop(self, ready):
+        u, g, k = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.windll.kernel32
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        u.DefWindowProcW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        u.DefWindowProcW.restype = LRESULT
+        u.CreateWindowExW.argtypes = (wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+                                      wintypes.HINSTANCE, wintypes.LPVOID)
+        u.CreateWindowExW.restype = wintypes.HWND
+        u.BeginPaint.restype = wintypes.HDC
+        u.BeginPaint.argtypes = (wintypes.HWND, ctypes.POINTER(PAINTSTRUCT))
+        u.EndPaint.argtypes = (wintypes.HWND, ctypes.POINTER(PAINTSTRUCT))
+        u.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT)
+        u.SetLayeredWindowAttributes.argtypes = (wintypes.HWND, wintypes.DWORD, ctypes.c_byte, wintypes.DWORD)
+        u.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        u.InvalidateRect.argtypes = (wintypes.HWND, ctypes.c_void_p, wintypes.BOOL)
+        u.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        g.CreateSolidBrush.argtypes, g.CreateSolidBrush.restype = (wintypes.DWORD,), wintypes.HBRUSH
+        g.SelectObject.argtypes, g.SelectObject.restype = (wintypes.HDC, wintypes.HGDIOBJ), wintypes.HGDIOBJ
+        g.GetStockObject.restype = wintypes.HGDIOBJ
+        g.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
+        g.Ellipse.argtypes = (wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int)
+        k.GetModuleHandleW.restype = wintypes.HMODULE
+        S = INDICATOR_SIZE
+
+        def wndproc(hwnd, msg, wp, lp):
+            try:
+                if msg == 0x8000:                                            # WM_APP from set()
+                    if self.state == "idle":
+                        u.ShowWindow(hwnd, 0)                                # SW_HIDE
+                    else:
+                        u.ShowWindow(hwnd, 4)                                # SW_SHOWNOACTIVATE
+                        u.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)  # stay on top
+                        u.InvalidateRect(hwnd, None, True)
+                    return 0
+                if msg == 0x000F:                                            # WM_PAINT
+                    ps = PAINTSTRUCT()
+                    hdc = u.BeginPaint(hwnd, ctypes.byref(ps))
+                    brush = g.CreateSolidBrush(_COLORS.get(self.state, _COLORS["rec"]))
+                    old_b = g.SelectObject(hdc, brush)
+                    old_p = g.SelectObject(hdc, g.GetStockObject(8))         # NULL_PEN: no outline
+                    g.Ellipse(hdc, 0, 0, S, S)
+                    g.SelectObject(hdc, old_p); g.SelectObject(hdc, old_b); g.DeleteObject(brush)
+                    u.EndPaint(hwnd, ctypes.byref(ps))
+                    return 0
+            except Exception:
+                pass
+            return u.DefWindowProcW(hwnd, msg, wp, lp)
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("style", wintypes.UINT), ("lpfnWndProc", WNDPROC),
+                        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE),
+                        ("hIcon", wintypes.HICON), ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                        ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR), ("hIconSm", wintypes.HICON)]
+
+        self._wndproc = WNDPROC(wndproc)                                     # keep a reference: ctypes must not free it
+        hinst = k.GetModuleHandleW(None)
+        wc = WNDCLASSEXW(cbSize=ctypes.sizeof(WNDCLASSEXW), lpfnWndProc=self._wndproc, hInstance=hinst,
+                         hbrBackground=g.CreateSolidBrush(_KEY), lpszClassName="DictateIndicator")
+        u.RegisterClassExW(ctypes.byref(wc))
+        x = (u.GetSystemMetrics(0) - S) // 2                                 # top centre of the primary screen
+        ex = 0x00000008 | 0x00000080 | 0x00080000 | 0x00000020 | 0x08000000  # TOPMOST TOOLWINDOW LAYERED TRANSPARENT NOACTIVATE
+        hwnd = u.CreateWindowExW(ex, "DictateIndicator", "Dictate", 0x80000000, x, 6, S, S, None, None, hinst, None)
+        if not hwnd:
+            raise OSError(f"CreateWindowEx failed ({ctypes.GetLastError()})")
+        u.SetLayeredWindowAttributes(hwnd, _KEY, 0, 0x1)                    # LWA_COLORKEY: magenta is see-through
+        self.hwnd = hwnd
+        ready.set()
+        msg = wintypes.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg)); u.DispatchMessageW(ctypes.byref(msg))
 
 
 # ----------------------------------------------------------------------------- microphone
@@ -362,7 +491,8 @@ def notify(cfg, msg, urgency="low"):
     pass                                                              # no toast yet: sounds + dashboard cover it
 
 
-_BEEPS = {"start": [(880, 90)], "done": [(1175, 70), (1568, 70)], "error": [(300, 250)]}
+_BEEPS = {"start": [(880, 90)], "done": [(1175, 70), (1568, 70)], "error": [(300, 250)],
+          "cancel": [(660, 60), (440, 90)]}
 
 
 def cue(cfg, name):
