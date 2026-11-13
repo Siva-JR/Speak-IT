@@ -13,8 +13,8 @@ import math
 import textfix
 HERE = Path(__file__).resolve().parent
 SR = 16000
-CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dictate"
-CFG = {"model": str(HERE.parent / "models" / "faster-whisper-base.en"), "compute_type": "int8", "beam_size": 2,
+from common import CONF_DIR, IS_WIN
+CFG = {"model": str(HERE.parent / "models" / "faster-whisper-base.en"), "compute_type": "int8", "device": "cpu", "gpu_compute_type": "float16", "beam_size": 2,
        "threads": 4, "remove_fillers": True, "auto_gain": True, "chunk_s": 28.0, "min_speech_s": 0.25,
        "min_speech_rms": 0.025, "halluc_filter": True,
        "min_window_s": 15.0, "window_step_s": 5.0}
@@ -70,8 +70,13 @@ def trim():
 
 
 def mem():
-    m = _proc.memory_full_info()
-    return {"rss_mb": round(m.rss / 1e6), "pss_mb": round(m.pss / 1e6), "uss_mb": round(m.uss / 1e6)}
+    """RSS/PSS/USS in MB. PSS exists only on Linux; elsewhere it falls back to USS. Stats must never break dictation."""
+    try:
+        m = _proc.memory_full_info()
+        uss = getattr(m, "uss", m.rss)
+        return {"rss_mb": round(m.rss / 1e6), "pss_mb": round(getattr(m, "pss", uss) / 1e6), "uss_mb": round(uss / 1e6)}
+    except Exception:
+        return {}
 
 
 def read_lines(name, default):
@@ -165,10 +170,28 @@ class Host:
     def __init__(self):
         from faster_whisper import WhisperModel
         t = time.perf_counter()
-        self.model = WhisperModel(CFG["model"], device="cpu", compute_type=CFG["compute_type"],
-                                  cpu_threads=int(CFG["threads"]), num_workers=1)
+        self.device = self._load(WhisperModel)
         self.load_s = time.perf_counter() - t
         trim()
+
+    def _load(self, WhisperModel):
+        want = str(CFG["device"]).lower()
+        if want in ("cuda", "gpu", "auto"):
+            try:
+                if IS_WIN:
+                    import platform_win; platform_win.add_cuda_dll_dirs()
+                import ctranslate2
+                if ctranslate2.get_cuda_device_count() < 1:
+                    raise RuntimeError("no CUDA device")
+                m = WhisperModel(CFG["model"], device="cuda", compute_type=CFG["gpu_compute_type"])
+                m.transcribe(np.zeros(SR, dtype=np.float32), language="en")   # force-load cuBLAS/cuDNN now, not mid-dictation
+                self.model = m
+                return "cuda"
+            except Exception as e:
+                print(f"[worker] GPU unavailable ({str(e)[:160]}); falling back to CPU", file=sys.stderr, flush=True)
+        self.model = WhisperModel(CFG["model"], device="cpu", compute_type=CFG["compute_type"],
+                                  cpu_threads=int(CFG["threads"]), num_workers=1)
+        return "cpu"
 
     def transcribe_chunk(self, audio, prompt):
         segs, _ = self.model.transcribe(
@@ -249,7 +272,7 @@ class Host:
 
 def main():
     host = Host()
-    print(json.dumps({"ready": True, "load_s": round(host.load_s, 3), "mem": mem()}), flush=True)
+    print(json.dumps({"ready": True, "device": host.device, "load_s": round(host.load_s, 3), "mem": mem()}), flush=True)
     ppid = os.getppid()
     for line in sys.stdin:
         if os.getppid() != ppid:
